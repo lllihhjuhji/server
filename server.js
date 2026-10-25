@@ -1,4 +1,3 @@
-cat > server.js <<'EOF'
 const http = require('http');
 const crypto = require('crypto');
 const { once } = require('events');
@@ -209,4 +208,3 @@ http
     }
   })
   .listen(PORT, '0.0.0.0', () => console.log(`addon listening on :${PORT}`));
-EOF
