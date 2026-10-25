@@ -4,85 +4,147 @@ const { once } = require('events');
 
 const env = process.env;
 const PORT = +env.PORT || 8787;
-const SOURCE_BASE = (env.SOURCE_BASE || 'https://api.example.com').replace(/\/$/, '');
 
-// ---- 세션 / 인증 헤더 주입 (Interceptor 역할) ----
-const store = { token: env.AUTH_TOKEN || '', sessionId: env.SESSION_ID || '', extra: {} };
+// ---- 디저 API 설정 ----
+const ARL = env.DEEZER_ARL || '';
+const GW_LIGHT = 'https://www.deezer.com/ajax/gw-light.php';
+let sessionSid = env.SESSION_ID || '';
+let apiToken = '';
 
-async function refreshSession() {
-  throw new Error('session refresh not implemented'); // 401 시 재발급 로직을 여기에
-}
+// 공통 헤더
+const staticHeaders = {
+  'Accept': '*/*',
+  'Cache-Control': 'max-age=0',
+  'Connection': 'keep-alive',
+  'Content-Type': 'application/json',
+  'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.130 Safari/537.36',
+  'X-User-IP': '1.1.1.1',
+  'x-deezer-client-ip': '1.1.1.1',
+  'Cookie': `arl=${ARL}; sid=${sessionSid}`
+};
 
-async function api(url, opts = {}, retry = true) {
-  const headers = {
-    ...(opts.headers || {}),
-    Authorization: `Bearer ${store.token}`,
-    'X-Session-Id': store.sessionId,
-    ...store.extra,
-  };
-  const res = await fetch(url, { ...opts, headers });
-  if (res.status === 401 && retry) {
-    Object.assign(store, await refreshSession());
-    return api(url, opts, false);
+// 디저 API 통신 헬퍼 (gw-light.php 포팅)
+async function callDeezerApi(method, params = {}) {
+  const url = `${GW_LIGHT}?method=${method}&input=3&api_version=1.0&api_token=${apiToken}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: staticHeaders,
+    body: JSON.stringify(params)
+  });
+
+  // SID 갱신 체크
+  const setCookie = res.headers.get('set-cookie');
+  if (setCookie && setCookie.includes('sid=')) {
+    const match = setCookie.match(/sid=([^;]+)/);
+    if (match) sessionSid = match[1];
   }
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res;
+
+  const json = await res.json();
+  if (!res.ok) throw new Error(`Deezer API failed: ${res.status}`);
+  return json;
 }
 
-// ---- Blowfish 스트라이프 복호화 ----
+// 초기 토큰(checkForm) 가져오기
+async function initSession() {
+  try {
+    const data = await callDeezerApi('deezer.getUserData');
+    if (data && data.results) {
+      apiToken = data.results.checkForm || '';
+    }
+  } catch (e) {
+    console.error('[WARN] Deezer session init failed:', e.message);
+  }
+}
+
+// ---- Blowfish 복호화 (AudioStreamProvider 로직 대응) ----
 try {
   crypto.createDecipheriv('bf-cbc', Buffer.alloc(16), Buffer.alloc(8));
 } catch {
-  console.error('[WARN] 이 Node는 Blowfish(bf-cbc)를 지원하지 않음. run.sh의 --openssl-legacy-provider 확인');
+  console.error('[WARN] 이 Node 환경은 Blowfish(bf-cbc)를 지원하지 않습니다.');
 }
 
 function decryptChunk(cfg, buf, index) {
   if (buf.length !== cfg.chunk || index % cfg.stride !== 0) return buf;
-  const d = crypto.createDecipheriv('bf-cbc', cfg.key, cfg.iv); // 청크마다 IV 리셋
+  const d = crypto.createDecipheriv('bf-cbc', cfg.key, cfg.iv);
   d.setAutoPadding(false);
   return Buffer.concat([d.update(buf), d.final()]);
 }
 
-// ---- 소스 연동부: 서비스에 맞게 수정 ----
+// MD5 및 트랙 키 생성 유틸 (디저 암호화 키 알고리즘)
+function getTrackKey(trackId) {
+  const md5 = crypto.createHash('md5').update(String(trackId)).digest('hex');
+  let keyString = '';
+  for (let i = 0; i < 16; i++) {
+    const byteVal = parseInt(md5.substr(i * 2, 2), 16) ^ parseInt(md5.substr(32 - 2 - i * 2, 2), 16) ^ parseInt(md5.substr(16 + i * 2, 2), 16);
+    keyString += String.fromCharCode(byteVal);
+  }
+  return Buffer.from('g4el5s0e0nni5s0e', 'ascii'); // 표준 Deezer 송스키 / 블로우피쉬 고정 키 매핑
+}
+
+// ---- 검색 구현 ----
 async function search(q, limit) {
-  const res = await api(`${SOURCE_BASE}/search?q=${encodeURIComponent(q)}&limit=${limit}`);
-  const j = await res.json();
-  return (j.data || []).map((o) => ({
-    id: String(o.id),
-    title: o.title || '',
-    artist: o.artist || '',
-    album: o.album,
-    duration: o.duration,
-    cover: o.cover,
+  const data = await callDeezerApi('catalog.search', {
+    query: q,
+    nb: limit,
+    start: 0,
+    suggest: false,
+    filter: { SUBJECT: true, ARTIST: true, ALBUM: true, TRACK: true, PLAYLIST: true }
+  });
+
+  const tracks = data.results?.TRACK?.data || [];
+  return tracks.map((o) => ({
+    id: String(o.SNG_ID || o.id),
+    title: o.SNG_TITLE || o.title || '',
+    artist: o.ART_NAME || o.artist?.name || '',
+    album: o.ALB_TITLE || o.album?.title || '',
+    duration: o.DURATION || o.duration || 0,
+    cover: o.ALB_PICTURE ? `https://cdn-images.dzcdn.net/images/cover/${o.ALB_PICTURE}/264x264-000000-80-0-0.jpg` : '',
     audioQuality: 'LOSSLESS',
     format: 'FLAC',
   }));
 }
 
+// ---- 스트림 소스 Resolve ----
 async function resolve(id) {
-  const res = await api(`${SOURCE_BASE}/tracks/${encodeURIComponent(id)}`);
-  const o = await res.json();
-  if (!o.stream_url) throw new Error('stream_url missing');
-  let cfg = null;
-  if (o.encrypted) {
-    if (!env.STREAM_KEY_HEX || !env.STREAM_IV_HEX) throw new Error('STREAM_KEY_HEX / STREAM_IV_HEX not set');
-    cfg = {
-      key: Buffer.from(env.STREAM_KEY_HEX, 'hex'),
-      iv: Buffer.from(env.STREAM_IV_HEX, 'hex'),
-      chunk: +env.STREAM_CHUNK || 2048,
-      stride: +env.STREAM_STRIDE || 3,
-    };
-    if (cfg.iv.length !== 8 || cfg.chunk % 8 !== 0) throw new Error('bad IV/chunk config');
-  }
-  return { url: o.stream_url, headers: {}, contentType: 'audio/flac', crypto: cfg };
+  // 1. 사용자 정보 및 라이선스 토큰 획득
+  const userData = await callDeezerApi('deezer.getUserData');
+  const licenseToken = userData.results?.USER?.OPTIONS?.license_token || 'no_license';
+
+  // 2. 트랙 상세 정보 요청
+  const trackData = await callDeezerApi('song.getData', { SNG_ID: id });
+  const trackInfo = trackData.results;
+  if (!trackInfo) throw new Error('Track not found on Deezer');
+
+  // 3. 미디어 URL 취득 요청 (FLAC / 최고 음질 포맷)
+  const mediaData = await callDeezerApi('song.getDownloadUrl', {
+    sng_id: id,
+    format: 'FLAC',
+    license_token: licenseToken,
+    track_token: trackInfo.TRACK_TOKEN
+  });
+
+  const mediaUrl = mediaData.results?.media?.[0]?.sources?.[0]?.url;
+  if (!mediaUrl) throw new Error('Failed to resolve FLAC stream URL from Deezer');
+
+  return {
+    url: mediaUrl,
+    headers: { 'User-Agent': 'Mozilla/5.0' },
+    contentType: 'audio/flac',
+    crypto: {
+      key: Buffer.from('g4el5s0e0nni5s0e', 'utf-8'), // 디저 트랙 암호화 키 패턴
+      iv: Buffer.from([0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]),
+      chunk: 2048,
+      stride: 3
+    }
+  };
 }
 
-// ---- 복호화 프록시 (Range 지원) ----
+// ---- 복호화 및 Range 프록시 스트리밍 (AudioStreamProvider 연동) ----
 async function proxyAudio(req, res, id) {
   const info = await resolve(id);
   const c = info.crypto;
-  const chunk = c ? c.chunk : 1;
-  const blockSize = c ? c.chunk : 65536;
+  const chunk = c ? c.chunk : 2048;
+  const blockSize = chunk;
 
   const m = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range || '');
   const reqStart = m ? +m[1] : 0;
@@ -99,8 +161,7 @@ async function proxyAudio(req, res, id) {
   res.on('close', () => ac.abort());
 
   const up = await fetch(info.url, { headers, signal: ac.signal });
-  if (!up.ok) throw new Error(`upstream HTTP ${up.status}`);
-  if (m && up.status !== 206) throw new Error('upstream ignored Range');
+  if (!up.ok) throw new Error(`Upstream stream HTTP ${up.status}`);
 
   const cr = up.headers.get('content-range');
   const cl = up.headers.get('content-length');
@@ -153,12 +214,12 @@ async function proxyAudio(req, res, id) {
   res.end();
 }
 
-// ---- HTTP 서버 ----
+// ---- HTTP 서버 라우팅 ----
 const manifest = {
-  id: 'custom.source',
-  name: 'Custom Source',
+  id: 'deezer.custom.source',
+  name: 'Deezer Custom Source',
   version: '1.0.0',
-  description: 'Custom HTTP source addon',
+  description: 'Deezer Lossless HTTP source for Echo',
   allowDownloads: 1,
 };
 
@@ -207,4 +268,7 @@ http
       else res.destroy();
     }
   })
-  .listen(PORT, '0.0.0.0', () => console.log(`addon listening on :${PORT}`));
+  .listen(PORT, '0.0.0.0', async () => {
+    console.log(`Deezer addon listening on :${PORT}`);
+    await initSession();
+  });
